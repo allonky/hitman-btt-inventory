@@ -1,7 +1,9 @@
+// Runs with NODEJS_HELPERS=0 (raw request stream needed for the PayPal signature check).
 // Hitman BTT inventory: /api/sold (GET) and /api/paypal-webhook (POST). Single file so it deploys from a flat upload.
 // Sold-slot store for the Hitman BTT sponsor page. Lives in Vercel Blob as sold.json.
 const { put, head } = require('@vercel/blob');
 const KEY = 'sold.json';
+function send(res, code, obj) { res.statusCode = code; res.setHeader('Content-Type', 'application/json'); res.setHeader('Cache-Control', 'no-store'); res.end(JSON.stringify(obj)); }
 async function read() {
   try {
     const h = await head(KEY);
@@ -57,32 +59,31 @@ function parseCustom(s) {
   return out;
 }
 async function webhook(req, res) {
-  if (req.method !== 'POST') return res.status(405).end();
+  if (req.method !== 'POST') return send(res, 405, { ok: false });
   const body = await rawBody(req);
   const v = await verify(req, body);
-  if (!v.ok) { console.warn('rejected webhook:', v.why); return res.status(400).json({ ok: false, why: v.why }); }
-  let ev; try { ev = JSON.parse(body.toString('utf8')); } catch (e) { return res.status(400).json({ ok: false }); }
+  if (!v.ok) { console.warn('rejected webhook:', v.why); return send(res, 400, { ok: false, why: v.why }); }
+  let ev; try { ev = JSON.parse(body.toString('utf8')); } catch (e) { return send(res, 400, { ok: false }); }
   const r = ev.resource || {};
-  if (ev.event_type !== 'PAYMENT.CAPTURE.COMPLETED' || r.status !== 'COMPLETED') return res.status(200).json({ ok: true, ignored: ev.event_type });
+  if (ev.event_type !== 'PAYMENT.CAPTURE.COMPLETED' || r.status !== 'COMPLETED') return send(res, 200, { ok: true, ignored: ev.event_type });
   const skus = parseCustom(r.custom_id);
   const d = await read();
-  if (d.events[r.id]) return res.status(200).json({ ok: true, dup: true });
+  if (d.events[r.id]) return send(res, 200, { ok: true, dup: true });
   d.events[r.id] = { at: r.create_time || new Date().toISOString(), amount: r.amount && r.amount.value, skus };
   Object.keys(skus).forEach(k => { d.sold[k] = (d.sold[k] || 0) + skus[k]; });
   await write(d);
-  res.status(200).json({ ok: true, sold: d.sold });
+  send(res, 200, { ok: true, sold: d.sold });
 }
 
 async function sold(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Cache-Control', 'no-store');
   const d = await read();
-  res.status(200).json({ sold: d.sold, updated: d.updated || null });
+  send(res, 200, { sold: d.sold, updated: d.updated || null });
 }
 module.exports = async (req, res) => {
   const path = (req.url || '').split('?')[0];
   if (path === '/api/sold') return sold(req, res);
   if (path === '/api/paypal-webhook') return webhook(req, res);
-  res.setHeader('Content-Type', 'text/plain');
-  res.status(200).send('hitman-btt-inventory: /api/sold, /api/paypal-webhook');
+  res.statusCode = 200; res.setHeader('Content-Type', 'text/plain');
+  res.end('hitman-btt-inventory: /api/sold, /api/paypal-webhook');
 };
