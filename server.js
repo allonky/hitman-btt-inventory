@@ -1,8 +1,25 @@
+// Hitman BTT inventory: /api/sold (GET) and /api/paypal-webhook (POST). Single file so it deploys from a flat upload.
+// Sold-slot store for the Hitman BTT sponsor page. Lives in Vercel Blob as sold.json.
+const { put, head } = require('@vercel/blob');
+const KEY = 'sold.json';
+async function read() {
+  try {
+    const h = await head(KEY);
+    const r = await fetch(h.url + '?t=' + Date.now(), { cache: 'no-store' });
+    if (!r.ok) return { sold: {}, events: {} };
+    const j = await r.json();
+    return { sold: j.sold || {}, events: j.events || {}, updated: j.updated };
+  } catch (e) { return { sold: {}, events: {} }; }
+}
+async function write(data) {
+  data.updated = new Date().toISOString();
+  await put(KEY, JSON.stringify(data), { access: 'public', addRandomSuffix: false, contentType: 'application/json', cacheControlMaxAge: 0 });
+  return data;
+}
+
 // POST /api/paypal-webhook  <- PayPal webhook (PAYMENT.CAPTURE.COMPLETED). Verifies PayPal's signature with
 // PayPal's public cert (no client secret needed), then records the SKUs from custom_id ("SKU:qty,SKU:qty").
 const crypto = require('crypto');
-const { read, write } = require('./_store');
-module.exports.config = { api: { bodyParser: false } };
 
 function crc32(buf) {
   let c, crc = 0xFFFFFFFF;
@@ -39,7 +56,7 @@ function parseCustom(s) {
   String(s || '').split(',').forEach(p => { const [sku, q] = p.split(':'); if (/^HBTT-SP-/.test(sku)) out[sku] = (out[sku] || 0) + (parseInt(q, 10) || 1); });
   return out;
 }
-module.exports = async (req, res) => {
+async function webhook(req, res) {
   if (req.method !== 'POST') return res.status(405).end();
   const body = await rawBody(req);
   const v = await verify(req, body);
@@ -54,4 +71,18 @@ module.exports = async (req, res) => {
   Object.keys(skus).forEach(k => { d.sold[k] = (d.sold[k] || 0) + skus[k]; });
   await write(d);
   res.status(200).json({ ok: true, sold: d.sold });
+}
+
+async function sold(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Cache-Control', 'no-store');
+  const d = await read();
+  res.status(200).json({ sold: d.sold, updated: d.updated || null });
+}
+module.exports = async (req, res) => {
+  const path = (req.url || '').split('?')[0];
+  if (path === '/api/sold') return sold(req, res);
+  if (path === '/api/paypal-webhook') return webhook(req, res);
+  res.setHeader('Content-Type', 'text/plain');
+  res.status(200).send('hitman-btt-inventory: /api/sold, /api/paypal-webhook');
 };
