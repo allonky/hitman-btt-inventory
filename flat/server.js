@@ -35,7 +35,7 @@ const CATALOG = {
   'HBTT-SP-VENDOR-2D':  { name: 'Vendor table, both days', price: 2500, cap: 6, kind: 'sponsor', pool: 'VENDOR' },
   'HBTT-SP-STATION-1D': { name: 'Tasting station sponsor, one day', price: 2000, cap: 10, kind: 'sponsor', pool: 'STATION' },
   'HBTT-SP-STATION-2D': { name: 'Tasting station sponsor, both days', price: 3500, cap: 10, kind: 'sponsor', pool: 'STATION' },
-  'HBTT-SP-CASE':       { name: 'Display case sponsor', price: 2500, cap: 1, kind: 'sponsor' },
+  'HBTT-SP-CASE':       { name: 'Entry display case sponsor', price: 2500, cap: 1, kind: 'sponsor' },
   'HBTT-SP-BLINDFOLD':  { name: 'Blindfold sponsor', price: 5000, cap: 1, kind: 'sponsor', pool: 'MERCH5' },
   'HBTT-SP-WRISTBAND':  { name: 'Wristband sponsor', price: 5000, cap: 1, kind: 'sponsor', pool: 'MERCH5' },
   'HBTT-SP-SCORECARD':  { name: 'Ticket and scorecard sponsor', price: 5000, cap: 1, kind: 'sponsor', pool: 'MERCH5' },
