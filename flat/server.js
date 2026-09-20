@@ -122,6 +122,12 @@ function catalog(req, res) { cors(res); send(res, 200, { catalog: CATALOG, pools
 
 async function order(req, res) {
   cors(res);
+  if (req.method === 'GET') {  // the buyer's receipt: tickets for a capture id (the buyer holds the id, PayPal shows it)
+    const c = clean(new URL(req.url, 'http://x').searchParams.get('c'), 40); const d = await read(); const o = d.orders[c];
+    if (!o) return send(res, 404, { ok: false });
+    const t = Object.values(d.tickets).filter(x => x.captureId === c).map(x => ({ code: x.code, name: x.name, day: x.day, type: x.type }));
+    return send(res, 200, { ok: true, confirmed: !!o.confirmed, env: o.env || 'live', tickets: t, emailed: !!o.sheetOk });
+  }
   let b; try { b = JSON.parse((await rawBody(req)).toString('utf8')); } catch (e) { return send(res, 400, { ok: false }); }
   const id = clean(b.captureId, 40); if (!id) return send(res, 400, { ok: false, why: 'no capture id' });
   const d = await read();
