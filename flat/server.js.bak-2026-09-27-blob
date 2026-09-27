@@ -1,4 +1,4 @@
-// The Reserve event backend: Hitman Blind Taste Test Colorado plus Nightmare on Bud St. One Vercel function, no framework. Its database is a hidden tab in the HBTT Google Sheet (was Vercel Blob until 2026-09-27).
+// The Reserve event backend: Hitman Blind Taste Test Colorado plus Nightmare on Bud St. One Vercel function, Blob store, no framework.
 // Runs with NODEJS_HELPERS=0 (raw request stream needed for the PayPal signature check).
 //
 //   GET  /api/sold                     sold counts per SKU (sponsor page + ticket page read this)
@@ -15,10 +15,11 @@
 // Events: every endpoint serves HBTT unless it gets ?event=nobs. PayPal captures and page posts are routed by SKU:
 // anything carrying a NOBS- SKU lives in its own store (nobs.json) and goes to the Sheet with event 'nobs'.
 //
-// Env: PAYPAL_WEBHOOK_ID (live), PAYPAL_WEBHOOK_ID_SANDBOX (test), ADMIN_KEY,
-//      SHEET_URL (Apps Script web app /exec, also hosts the database: store_get / store_put), SHEET_KEY (must match SHEET_KEY script property),
+// Env: BLOB_READ_WRITE_TOKEN (store), PAYPAL_WEBHOOK_ID (live), PAYPAL_WEBHOOK_ID_SANDBOX (test), ADMIN_KEY,
+//      SHEET_URL (Apps Script web app /exec), SHEET_KEY (must match SHEET_KEY script property),
 //      NOBS_SHEET_URL / NOBS_SHEET_KEY (the Nightmare on Bud St. Sheet script; until set, NOBS orders are kept here unsent).
 const crypto = require('crypto');
+const { put, head } = require('@vercel/blob');
 
 const EVENTS = {
   hbtt: { key: 'sold.json', prefix: 'HBTT-', sheet: '' },
@@ -64,50 +65,21 @@ const CATALOG = {
 const POOLS = { VENDOR: 6, STATION: 10, PRESENT: 3, MERCH5: 5 };
 function catalogFor(ev) { const out = {}; Object.keys(CATALOG).forEach(k => { if ((CATALOG[k].event || 'hbtt') === ev) out[k] = CATALOG[k]; }); return out; }
 
-// ---------- store: the HBTT Sheet script keeps one JSON document per event (store_get / store_put, versioned) ----------
-// Fail closed: if the Sheet cannot be reached the request fails (5xx) instead of pretending the store is empty.
-// PayPal retries a failed webhook, the ticket page retries its post, so nothing is lost while the store is down.
-function emptyStore() { return { sold: {}, events: {}, orders: {}, tickets: {}, entries: {}, payers: {} }; }
-function clone(x) { return JSON.parse(JSON.stringify(x)); }
-const sleep = ms => new Promise(r => setTimeout(r, ms));
-const CACHE = {};   // per warm instance: ev -> { at, d }. Only public GETs use it.
-async function storeCall(body) {
-  const url = process.env.SHEET_URL, key = process.env.SHEET_KEY;
-  if (!url || !key) { const e = new Error('store: SHEET_URL/SHEET_KEY not set'); e.store = true; throw e; }
-  let r, t;
-  try { r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify(Object.assign({ key }, body)), redirect: 'follow' }); t = await r.text(); }
-  catch (x) { const e = new Error('store: unreachable (' + (x.message || x) + ')'); e.store = true; throw e; }
-  let j; try { j = JSON.parse(t); } catch (x) { const e = new Error('store: bad response ' + r.status); e.store = true; throw e; }
-  if (!j.ok && !j.conflict) { const e = new Error('store: ' + (j.error || 'refused')); e.store = true; throw e; }
-  return j;
-}
-async function read(ev, opts) {
-  ev = ev || 'hbtt';
-  if (opts && opts.cached && CACHE[ev] && Date.now() - CACHE[ev].at < 15000) return clone(CACHE[ev].d);
-  const j = await storeCall({ action: 'store_get', name: ev });
-  const d = Object.assign(emptyStore(), j.doc ? JSON.parse(j.doc) : {});
-  Object.defineProperty(d, '_v', { value: j.version, writable: true, enumerable: false });
-  CACHE[ev] = { at: Date.now(), d: clone(d) };
-  return d;
+// ---------- store ----------
+async function read(ev) {
+  const KEY = EVENTS[ev || 'hbtt'].key;
+  try {
+    const h = await head(KEY);
+    const r = await fetch(h.url + '?t=' + Date.now(), { cache: 'no-store' });
+    if (!r.ok) throw new Error('blob ' + r.status);
+    const j = await r.json();
+    return { sold: j.sold || {}, events: j.events || {}, orders: j.orders || {}, tickets: j.tickets || {}, entries: j.entries || {}, payers: j.payers || {}, updated: j.updated };
+  } catch (e) { return { sold: {}, events: {}, orders: {}, tickets: {}, entries: {}, payers: {} }; }
 }
 async function write(d, ev) {
-  ev = ev || 'hbtt';
   d.updated = new Date().toISOString();
-  const j = await storeCall({ action: 'store_put', name: ev, doc: JSON.stringify(d), version: d._v });
-  if (j.conflict) { const e = new Error('store: conflict'); e.conflict = true; throw e; }
-  d._v = j.version; CACHE[ev] = { at: Date.now(), d: clone(d) };
+  await put(EVENTS[ev || 'hbtt'].key, JSON.stringify(d), { access: 'public', addRandomSuffix: false, contentType: 'application/json', cacheControlMaxAge: 0 });
   return d;
-}
-// read, change, write; on a version conflict re-read and re-apply. fn must only touch d (no network), it can run more than once.
-async function mutate(ev, fn) {
-  for (let i = 0; i < 6; i++) {
-    const d = await read(ev);
-    const out = fn(d);
-    if (out && out.noWrite) return out;
-    try { await write(d, ev); return out; }
-    catch (e) { if (!e.conflict) throw e; await sleep(250 * (i + 1) + crypto.randomInt(200)); }
-  }
-  const e = new Error('store: busy, try again'); e.store = true; throw e;
 }
 function rawBody(req) { return new Promise((resolve, reject) => { const c = []; req.on('data', x => c.push(x)); req.on('end', () => resolve(Buffer.concat(c))); req.on('error', reject); }); }
 
@@ -152,12 +124,6 @@ function issueTickets(d, o) {
 }
 
 // ---------- Google Sheet (Apps Script) hand-off: rows + the buyer email ----------
-// push an order to its Sheet, then make sure the store says it went (skipped when the Sheet script already marked it)
-async function finish(ev, o, t) {
-  const sheet = await pushToSheet(o, t, ev);
-  if (sheet.ok && !(sheet.resp && sheet.resp.storeMarked)) await mutate(ev, d => { const x = d.orders[o.id]; if (!x) return { noWrite: true }; x.sheetOk = true; x.sheetAt = new Date().toISOString(); });
-  return sheet;
-}
 async function pushToSheet(o, tickets, ev) {
   const E = EVENTS[ev || 'hbtt'];
   // an event with its own Sheet never falls back to the HBTT one (that script would email an HBTT ticket)
@@ -165,7 +131,6 @@ async function pushToSheet(o, tickets, ev) {
   if (!url || !key) return { ok: false, why: (E.urlEnv || 'SHEET_URL') + '/' + (E.keyEnv || 'SHEET_KEY') + ' not set' };
   const payload = { action: 'issue', key, order: o, tickets, items: Object.keys(o.lines || {}).map(k => ({ sku: k, name: (CATALOG[k] || {}).name || k, qty: o.lines[k], price: (CATALOG[k] || {}).price || 0 })) };
   if (E.sheet) payload.event = E.sheet;
-  if (!E.urlEnv) payload.store = ev || 'hbtt';   // same script as the store: it flips sheetOk itself
   try {
     const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify(payload), redirect: 'follow' });
     const t = await r.text(); let j = {}; try { j = JSON.parse(t); } catch (e) { j = { raw: t.slice(0, 200) }; }
@@ -174,11 +139,7 @@ async function pushToSheet(o, tickets, ev) {
 }
 
 // ---------- handlers ----------
-async function sold(req, res) {
-  cors(res); const d = await read(eventParam(req), { cached: true });
-  res.statusCode = 200; res.setHeader('Content-Type', 'application/json'); res.setHeader('Cache-Control', 'public, max-age=0, s-maxage=15, stale-while-revalidate=60');
-  res.end(JSON.stringify({ sold: d.sold, updated: d.updated || null }));
-}
+async function sold(req, res) { cors(res); const d = await read(eventParam(req)); send(res, 200, { sold: d.sold, updated: d.updated || null }); }
 function catalog(req, res) { cors(res); const ev = eventParam(req); send(res, 200, { catalog: catalogFor(ev), pools: ev === 'hbtt' ? POOLS : {} }); }
 
 async function order(req, res) {
@@ -196,24 +157,25 @@ async function order(req, res) {
   let b; try { b = JSON.parse((await rawBody(req)).toString('utf8')); } catch (e) { return send(res, 400, { ok: false }); }
   const id = clean(b.captureId, 40); if (!id) return send(res, 400, { ok: false, why: 'no capture id' });
   const ev = eventOfSkus(b.lines);
-  const r = await mutate(ev, d => {
-    const o = d.orders[id] || { id, at: new Date().toISOString(), confirmed: false, env: 'live' };
-    o.source = o.source === 'webhook' || o.source === 'both' ? 'both' : 'page';
-    o.paypalOrderId = clean(b.paypalOrderId, 40) || o.paypalOrderId || '';
-    o.kind = clean(b.kind, 12) || o.kind || '';
-    o.company = clean(b.company, 120); o.name = clean(b.name, 120); o.email = clean(b.email, 160); o.phone = clean(b.phone, 40); o.instagram = clean(b.instagram, 60); o.notes = clean(b.notes, 500);
-    o.lines = (b.lines && typeof b.lines === 'object') ? b.lines : (o.lines || {});
-    if (b.attendees && typeof b.attendees === 'object') { o.attendees = {}; Object.keys(b.attendees).forEach(k => { if (CATALOG[k]) o.attendees[k] = [].concat(b.attendees[k]).slice(0, 10).map(x => clean(x, 120)); }); }
-    o.total = clean(b.total, 20); o.subtotal = clean(b.subtotal, 20); o.tax = clean(b.tax, 20); o.taxRate = clean(b.taxRate, 10); o.agreedAt = clean(b.agreedAt, 40); o.termsVersion = clean(b.termsVersion, 20); o.payerEmail = clean(b.payerEmail, 160); o.payerName = clean(b.payerName, 120); o.payerId = clean(b.payerId, 40);
-    if (b.sandbox === true) o.env = 'sandbox';
-    d.orders[id] = o;
-    // if the webhook already confirmed this capture (it can arrive first), issue now; the email goes out below
-    const t = o.confirmed ? issueTickets(d, o) : [];
-    return { o: clone(o), t: clone(t) };
-  });
+  const d = await read(ev);
+  const o = d.orders[id] || { id, at: new Date().toISOString(), confirmed: false, env: 'live' };
+  o.source = o.source === 'webhook' ? 'both' : 'page';
+  o.paypalOrderId = clean(b.paypalOrderId, 40) || o.paypalOrderId || '';
+  o.kind = clean(b.kind, 12) || o.kind || '';
+  o.company = clean(b.company, 120); o.name = clean(b.name, 120); o.email = clean(b.email, 160); o.phone = clean(b.phone, 40); o.instagram = clean(b.instagram, 60); o.notes = clean(b.notes, 500);
+  o.lines = (b.lines && typeof b.lines === 'object') ? b.lines : (o.lines || {});
+  if (b.attendees && typeof b.attendees === 'object') { o.attendees = {}; Object.keys(b.attendees).forEach(k => { if (CATALOG[k]) o.attendees[k] = [].concat(b.attendees[k]).slice(0, 10).map(x => clean(x, 120)); }); }
+  o.total = clean(b.total, 20); o.subtotal = clean(b.subtotal, 20); o.tax = clean(b.tax, 20); o.taxRate = clean(b.taxRate, 10); o.agreedAt = clean(b.agreedAt, 40); o.termsVersion = clean(b.termsVersion, 20); o.payerEmail = clean(b.payerEmail, 160); o.payerName = clean(b.payerName, 120); o.payerId = clean(b.payerId, 40);
+  if (b.sandbox === true) o.env = 'sandbox';
+  d.orders[id] = o;
+  // if the webhook already confirmed this capture (it can arrive first), finish the job now
   let sheet = null;
-  if (r.o.confirmed && !r.o.sheetOk) sheet = await finish(ev, r.o, r.t);
-  send(res, 200, { ok: true, confirmed: !!r.o.confirmed, sheet });
+  if (o.confirmed) {
+    const t = issueTickets(d, o);
+    if (!o.sheetOk) { sheet = await pushToSheet(o, t, ev); o.sheetOk = !!sheet.ok; o.sheetAt = new Date().toISOString(); }
+  }
+  await write(d, ev);
+  send(res, 200, { ok: true, confirmed: !!o.confirmed, sheet });
 }
 
 async function webhook(req, res) {
@@ -230,44 +192,39 @@ async function webhook(req, res) {
     const info = { email: clean(py.email_address, 160), name: clean([py.name && py.name.given_name, py.name && py.name.surname].filter(Boolean).join(' '), 120), payerId: clean(py.payer_id, 40), captures: caps, skus: parseCustom(pu.custom_id), at: new Date().toISOString() };
     if (!info.email && !info.name) return send(res, 200, { ok: true, ignored: ev.event_type, why: 'no payer' });
     const evO = eventOfSkus(info.skus);
-    const out = await mutate(evO, d0 => {
-      d0.payers = d0.payers || {}; d0.payers[r.id] = info;
-      let fixed = 0; const todo = [];
-      Object.values(d0.orders).forEach(o => {
-        if (o.paypalOrderId !== r.id && caps.indexOf(o.id) < 0) return;
-        if (!o.payerEmail) o.payerEmail = info.email; if (!o.payerName) o.payerName = info.name; if (!o.payerId) o.payerId = info.payerId;
-        if (!o.name) o.name = info.name; if (!o.email) o.email = info.email; fixed++;
-        if (o.confirmed && !o.sheetOk && (o.email || o.payerEmail)) todo.push({ o: clone(o), t: clone(issueTickets(d0, o)) });
-      });
-      return { fixed, todo };
+    const d0 = await read(evO); d0.payers = d0.payers || {}; d0.payers[r.id] = info;
+    let fixed = 0;
+    Object.values(d0.orders).forEach(o => {
+      if (o.paypalOrderId !== r.id && caps.indexOf(o.id) < 0) return;
+      if (!o.payerEmail) o.payerEmail = info.email; if (!o.payerName) o.payerName = info.name; if (!o.payerId) o.payerId = info.payerId;
+      if (!o.name) o.name = info.name; if (!o.email) o.email = info.email; fixed++;
     });
     const fin = [];
-    for (const x of out.todo) { await finish(evO, x.o, x.t); fin.push(x.o.id); }
-    return send(res, 200, { ok: true, payer: true, fixed: out.fixed, finished: fin });
+    for (const o of Object.values(d0.orders)) { if ((o.paypalOrderId === r.id || caps.indexOf(o.id) > -1) && o.confirmed && !o.sheetOk && (o.email || o.payerEmail)) { const t = issueTickets(d0, o); const sh = await pushToSheet(o, t, evO); o.sheetOk = !!sh.ok; o.sheetAt = new Date().toISOString(); fin.push(o.id); } }
+    await write(d0, evO);
+    return send(res, 200, { ok: true, payer: true, fixed, finished: fin });
   }
   if (ev.event_type !== 'PAYMENT.CAPTURE.COMPLETED' || r.status !== 'COMPLETED') { console.log('ignored webhook', ev.event_type); return send(res, 200, { ok: true, ignored: ev.event_type }); }
   const skus = parseCustom(r.custom_id);
   const evC = eventOfSkus(skus);
-  const out = await mutate(evC, d => {
-    if (d.events[r.id]) { const o0 = d.orders[r.id]; return (o0 && o0.confirmed && !o0.sheetOk && (o0.email || o0.payerEmail)) ? { dup: true, o: clone(o0), t: clone(issueTickets(d, o0)) } : { dup: true, noWrite: true }; }
-    d.events[r.id] = { at: r.create_time || new Date().toISOString(), amount: r.amount && r.amount.value, skus, env: v.env };
-    if (v.env === 'live') Object.keys(skus).forEach(k => { d.sold[k] = (d.sold[k] || 0) + skus[k]; });
-    const o = d.orders[r.id] || { id: r.id, at: r.create_time || new Date().toISOString(), source: 'webhook', lines: skus };
-    if (o.source === 'page') o.source = 'both';
-    o.confirmed = true; o.env = v.env; o.amount = r.amount && r.amount.value; o.currency = (r.amount && r.amount.currency_code) || 'USD'; o.capturedAt = r.create_time || o.capturedAt || '';
-    const brk = r.seller_receivable_breakdown || {}; o.gross = brk.gross_amount && brk.gross_amount.value; o.fee = brk.paypal_fee && brk.paypal_fee.value; o.net = brk.net_amount && brk.net_amount.value; o.paypalStatus = r.status;
-    o.paypalOrderId = (r.supplementary_data && r.supplementary_data.related_ids && r.supplementary_data.related_ids.order_id) || o.paypalOrderId || '';
-    if (!o.lines || !Object.keys(o.lines).length) o.lines = skus;
-    const known = (d.payers || {})[o.paypalOrderId];
-    if (known) { if (!o.payerEmail) o.payerEmail = known.email; if (!o.payerName) o.payerName = known.name; if (!o.payerId) o.payerId = known.payerId; if (!o.name) o.name = known.name; if (!o.email) o.email = known.email; }
-    d.orders[r.id] = o;
-    return { o: clone(o), t: clone(issueTickets(d, o)), sold: clone(d.sold) };
-  });
-  if (out.dup && !out.o) return send(res, 200, { ok: true, dup: true });
-  // email only once the page (or the order event) has told us who bought; otherwise /api/order or the order event finishes it
+  const d = await read(evC);
+  if (d.events[r.id]) return send(res, 200, { ok: true, dup: true });
+  d.events[r.id] = { at: r.create_time || new Date().toISOString(), amount: r.amount && r.amount.value, skus, env: v.env };
+  if (v.env === 'live') Object.keys(skus).forEach(k => { d.sold[k] = (d.sold[k] || 0) + skus[k]; });
+  const o = d.orders[r.id] || { id: r.id, at: r.create_time || new Date().toISOString(), source: 'webhook', lines: skus };
+  o.confirmed = true; o.env = v.env; o.amount = r.amount && r.amount.value; o.currency = (r.amount && r.amount.currency_code) || 'USD'; o.capturedAt = r.create_time || o.capturedAt || '';
+  const brk = r.seller_receivable_breakdown || {}; o.gross = brk.gross_amount && brk.gross_amount.value; o.fee = brk.paypal_fee && brk.paypal_fee.value; o.net = brk.net_amount && brk.net_amount.value; o.paypalStatus = r.status;
+  o.paypalOrderId = (r.supplementary_data && r.supplementary_data.related_ids && r.supplementary_data.related_ids.order_id) || o.paypalOrderId || '';
+  if (!o.lines || !Object.keys(o.lines).length) o.lines = skus;
+  const known = (d.payers || {})[o.paypalOrderId];
+  if (known) { if (!o.payerEmail) o.payerEmail = known.email; if (!o.payerName) o.payerName = known.name; if (!o.payerId) o.payerId = known.payerId; if (!o.name) o.name = known.name; if (!o.email) o.email = known.email; }
+  d.orders[r.id] = o;
+  const tickets = issueTickets(d, o);
+  // push to the Sheet only once the page has told us who bought (name/email). If the page post has not landed yet, /api/order finishes it.
   let sheet = null;
-  if ((out.o.email || out.o.payerEmail) && !out.o.sheetOk) sheet = await finish(evC, out.o, out.t);
-  send(res, 200, { ok: true, env: v.env, sold: out.sold, tickets: out.t.length, sheet });
+  if ((o.email || o.payerEmail) && !o.sheetOk) { sheet = await pushToSheet(o, tickets, evC); o.sheetOk = !!sheet.ok; o.sheetAt = new Date().toISOString(); }
+  await write(d, evC);
+  send(res, 200, { ok: true, env: v.env, sold: d.sold, tickets: tickets.length, sheet });
 }
 
 async function qr(req, res) {
@@ -284,7 +241,7 @@ async function qr(req, res) {
 async function ticket(req, res) {
   cors(res);
   const c = clean(new URL(req.url, 'http://x').searchParams.get('c'), 40).toUpperCase();
-  const d = await read(c.startsWith('NOBS-') ? 'nobs' : 'hbtt', { cached: true }); const t = d.tickets[c];
+  const d = await read(c.startsWith('NOBS-') ? 'nobs' : 'hbtt'); const t = d.tickets[c];
   if (!t) return send(res, 404, { ok: false, error: 'No ticket with that code.' });
   send(res, 200, { ok: true, code: t.code, day: t.day, type: t.type, name: t.name, env: t.env });
 }
@@ -307,29 +264,25 @@ async function ticketsCsv(req, res) {
 async function resend(req, res) {
   const q = admin(req, res); if (!q) return;
   const ev = eventParam(req);
-  const id = clean(q.get('capture'), 40);
-  const r = await mutate(ev, d => { const o = d.orders[id]; if (!o) return { none: true, noWrite: true }; return { o: clone(o), t: clone(issueTickets(d, o)) }; });
-  if (r.none) return send(res, 404, { ok: false, why: 'no such capture' });
-  const sheet = await finish(ev, r.o, r.t); send(res, 200, { ok: true, sheet, tickets: r.t.map(x => x.code) });
+  const id = clean(q.get('capture'), 40); const d = await read(ev); const o = d.orders[id];
+  if (!o) return send(res, 404, { ok: false, why: 'no such capture' });
+  const t = issueTickets(d, o); const sheet = await pushToSheet(o, t, ev); o.sheetOk = !!sheet.ok; o.sheetAt = new Date().toISOString();
+  await write(d, ev); send(res, 200, { ok: true, sheet, tickets: t.map(x => x.code) });
 }
 
 // GET /api/complete?key=ADMIN&capture=ID&name=..&email=..[&phone=..]  fill in a buyer the page never told us about, issue named tickets, push to the Sheet (emails them)
 async function complete(req, res) {
   const q = admin(req, res); if (!q) return;
   const ev = eventParam(req);
-  const id = clean(q.get('capture'), 40);
+  const id = clean(q.get('capture'), 40); const d = await read(ev); const o = d.orders[id];
+  if (!o) return send(res, 404, { ok: false, why: 'no such capture' });
   const name = clean(q.get('name'), 120), email = clean(q.get('email'), 160), phone = clean(q.get('phone'), 40);
-  const r = await mutate(ev, d => {
-    const o = d.orders[id]; if (!o) return { why: 'no such capture', code: 404, noWrite: true };
-    if (name) o.name = name; if (email) o.email = email; if (phone) o.phone = phone;
-    if (!o.kind) o.kind = Object.keys(o.lines || {}).some(isTicketSku) ? 'ticket' : 'sponsor';
-    if (!(o.email || o.payerEmail)) return { why: 'no email to send to', code: 400, noWrite: true };
-    o.attendees = o.attendees || {}; Object.keys(o.lines || {}).forEach(k => { if (CATALOG[k] && CATALOG[k].kind === 'ticket' && !(o.attendees[k] && o.attendees[k].length)) o.attendees[k] = Array(o.lines[k]).fill(o.name || o.payerName || ''); });
-    return { o: clone(o), t: clone(issueTickets(d, o)) };
-  });
-  if (r.why) return send(res, r.code, { ok: false, why: r.why });
-  const sheet = await finish(ev, r.o, r.t);
-  send(res, 200, { ok: true, sheet, name: r.o.name, email: r.o.email || r.o.payerEmail, tickets: r.t.map(x => ({ code: x.code, name: x.name, day: x.day })) });
+  if (name) o.name = name; if (email) o.email = email; if (phone) o.phone = phone;
+  if (!o.kind) o.kind = Object.keys(o.lines || {}).some(isTicketSku) ? 'ticket' : 'sponsor';
+  if (!(o.email || o.payerEmail)) return send(res, 400, { ok: false, why: 'no email to send to' });
+  o.attendees = o.attendees || {}; Object.keys(o.lines || {}).forEach(k => { if (CATALOG[k] && CATALOG[k].kind === 'ticket' && !(o.attendees[k] && o.attendees[k].length)) o.attendees[k] = Array(o.lines[k]).fill(o.name || o.payerName || ''); });
+  const t = issueTickets(d, o); const sheet = await pushToSheet(o, t, ev); o.sheetOk = !!sheet.ok; o.sheetAt = new Date().toISOString();
+  await write(d, ev); send(res, 200, { ok: true, sheet, name: o.name, email: o.email || o.payerEmail, tickets: t.map(x => ({ code: x.code, name: x.name, day: x.day })) });
 }
 // POST /api/enter   licensed dispensary entry form (reservethereserve.com/blindtastetest/enter): stores it, hands it to the Sheet (which emails us + the brand)
 async function enter(req, res) {
@@ -339,14 +292,15 @@ async function enter(req, res) {
   const e = { company: clean(b.company, 120), license: clean(b.license, 60), rep: clean(b.rep, 120), phone: clean(b.phone, 40), email: clean(b.email, 160), instagram: clean(b.instagram, 60), strain: clean(b.strain, 120), method: clean(b.method, 20), notes: clean(b.notes, 1000), agreed: b.agreed === true, env: b.test === true ? 'test' : 'live', at: new Date().toISOString() };
   if (!e.company || !e.license || !e.rep || !e.phone || !/.+@.+\..+/.test(e.email) || !e.strain || !/^Live r(e|o)sin$/.test(e.method) || !e.agreed) return send(res, 400, { ok: false, why: 'missing fields' });
   e.id = 'E' + Date.now().toString(36).toUpperCase() + crypto.randomInt(1000).toString().padStart(3, '0');
-  await mutate('hbtt', d => { d.entries = d.entries || {}; d.entries[e.id] = e; });
+  const d = await read(); d.entries = d.entries || {}; d.entries[e.id] = e;
   let sheet = { ok: false, why: 'SHEET_URL/SHEET_KEY not set' };
   const url = process.env.SHEET_URL, key = process.env.SHEET_KEY;
   if (url && key) {
-    try { const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify({ action: 'entry', key, entry: e, store: 'hbtt' }), redirect: 'follow' }); const t = await r.text(); let j = {}; try { j = JSON.parse(t); } catch (x) { j = { raw: t.slice(0, 120) }; } sheet = { ok: r.ok && j.ok !== false, resp: j }; }
+    try { const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify({ action: 'entry', key, entry: e }) }); const t = await r.text(); let j = {}; try { j = JSON.parse(t); } catch (x) { j = { raw: t.slice(0, 120) }; } sheet = { ok: r.ok && j.ok !== false, resp: j }; }
     catch (x) { sheet = { ok: false, why: String(x.message || x) }; }
   }
-  if (sheet.ok && !(sheet.resp && sheet.resp.storeMarked)) await mutate('hbtt', d => { const x = d.entries && d.entries[e.id]; if (!x) return { noWrite: true }; x.sheetOk = true; x.sheetAt = new Date().toISOString(); });
+  e.sheetOk = !!sheet.ok; e.sheetAt = new Date().toISOString();
+  await write(d);
   send(res, 200, { ok: true, id: e.id, sheet: sheet.ok });
 }
 async function entriesCsv(req, res) {
@@ -384,7 +338,7 @@ module.exports = async (req, res) => {
     if (path === '/api/enter') return await enter(req, res);
     if (path === '/api/entries.csv') return await entriesCsv(req, res);
     if (path === '/api/dash') return await dash(req, res);
-  } catch (e) { console.error(e); if (!res.headersSent) return send(res, e.store ? 503 : 500, { ok: false, why: String(e.message || e) }); }
+  } catch (e) { console.error(e); return send(res, 500, { ok: false, why: String(e.message || e) }); }
   res.statusCode = 200; res.setHeader('Content-Type', 'text/plain');
   res.end('hitman-btt backend: /api/sold /api/catalog /api/order /api/paypal-webhook /api/qr /api/ticket /api/orders.csv /api/tickets.csv /api/resend /api/complete /api/dash');
 };
