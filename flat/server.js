@@ -37,15 +37,12 @@ function clean(v, n) { return String(v == null ? '' : v).replace(/[\r\n\t]+/g, '
 const CATALOG = {
   // tickets
   'HBTT-TK-SAT':  { name: 'Saturday Testing Pass', price: 200, cap: 100, kind: 'ticket', day: 'Saturday', type: 'Saturday Testing Pass', max: 10 },
-  'HBTT-TK-SUN':  { name: 'Sunday Testing Pass',   price: 200, cap: 100, kind: 'ticket', day: 'Sunday',   type: 'Sunday Testing Pass',   max: 10 },
   'HBTT-TK-VIP':  { name: 'QCB Preparty VIP',      price: 200, cap: 20,  kind: 'ticket', day: 'Preparty', type: 'QCB Preparty VIP',          max: 4 },
   'HBTT-TK-GA':   { name: 'QCB Preparty GA',       price: 20,  cap: 150, kind: 'ticket', day: 'Preparty', type: 'QCB Preparty GA',           max: 6 },
   // sponsorships
   'HBTT-SP-SUPPORT':    { name: 'Supporting sponsor', price: 1500, cap: 8, kind: 'sponsor' },
-  'HBTT-SP-VENDOR-1D':  { name: 'Vendor table, one day', price: 1500, cap: 6, kind: 'sponsor', pool: 'VENDOR' },
-  'HBTT-SP-VENDOR-2D':  { name: 'Vendor table, both days', price: 2500, cap: 6, kind: 'sponsor', pool: 'VENDOR' },
-  'HBTT-SP-STATION-1D': { name: 'Tasting station sponsor, one day', price: 2000, cap: 10, kind: 'sponsor', pool: 'STATION' },
-  'HBTT-SP-STATION-2D': { name: 'Tasting station sponsor, both days', price: 3500, cap: 10, kind: 'sponsor', pool: 'STATION' },
+  'HBTT-SP-VENDOR-1D':  { name: 'Vendor table', price: 1500, cap: 6, kind: 'sponsor', pool: 'VENDOR' },
+  'HBTT-SP-STATION-1D': { name: 'Tasting station sponsor', price: 2000, cap: 10, kind: 'sponsor', pool: 'STATION' },
   'HBTT-SP-CASE':       { name: 'Entry display case sponsor', price: 2500, cap: 1, kind: 'sponsor' },
   'HBTT-SP-BLINDFOLD':  { name: 'Blindfold sponsor', price: 5000, cap: 1, kind: 'sponsor', pool: 'MERCH5' },
   'HBTT-SP-WRISTBAND':  { name: 'Wristband sponsor', price: 5000, cap: 1, kind: 'sponsor', pool: 'MERCH5' },
@@ -130,7 +127,7 @@ async function verify(req, body) {
 function parseCustom(s) { const out = {}; String(s || '').split(',').forEach(p => { const [sku, q] = p.split(':'); if (CATALOG[sku]) out[sku] = (out[sku] || 0) + (parseInt(q, 10) || 1); }); return out; }
 
 // ---------- tickets ----------
-const CODE_PREFIX = { 'HBTT-TK-SAT': 'SAT', 'HBTT-TK-SUN': 'SUN', 'HBTT-TK-VIP': 'VIP', 'HBTT-TK-GA': 'GA', 'NOBS-TK-GA': 'GA' };
+const CODE_PREFIX = { 'HBTT-TK-SAT': 'SAT', 'HBTT-TK-VIP': 'VIP', 'HBTT-TK-GA': 'GA', 'NOBS-TK-GA': 'GA' };
 // HBTT-SAT-XXXX / HBTT-SUN-XXXX (VIP / GA for the preparty), NOBS-GA-XXXX: 4 random chars, no 0/O/1/I, unique against every code issued
 function genCode(existing, sku) { const a = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; const pre = CODE_PREFIX[sku] || 'TK'; const ev = (CATALOG[sku] && CATALOG[sku].event) || 'hbtt'; for (;;) { let s = ''; for (let i = 0; i < 4; i++) s += a[crypto.randomInt(a.length)]; const c = EVENTS[ev].prefix + pre + '-' + s; if (!existing[c]) return c; } }
 function issueTickets(d, o) {
