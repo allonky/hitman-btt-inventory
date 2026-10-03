@@ -59,7 +59,15 @@ const CATALOG = {
   'NOBS-TK-GA':         { name: 'Nightmare on Bud St. Party Ticket', price: 50, cap: 150, kind: 'ticket', day: 'Halloween', type: 'Party Ticket', max: 10, event: 'nobs' }
 };
 const POOLS = { VENDOR: 6, STATION: 10, PRESENT: 3, MERCH5: 5 };
-function catalogFor(ev) { const out = {}; Object.keys(CATALOG).forEach(k => { if ((CATALOG[k].event || 'hbtt') === ev) out[k] = CATALOG[k]; }); return out; }
+function catalogFor(ev, all) { const out = {}; Object.keys(CATALOG).forEach(k => { if ((CATALOG[k].event || 'hbtt') === ev && (all || !CATALOG[k].hidden)) out[k] = CATALOG[k]; }); return out; }
+
+// ---------- sponsor invoices: the pay page looks one up by its unguessable token; names and amounts never sit in public files ----------
+// Sponsor invoices live in the HBTT_INVOICES env var, never in this file (the repo is public). JSON shape:
+//   { "<token>": { "id": "BTT-2026-001", "sku": "HBTT-SP-INV-001", "company": "...", "email": "...", "item": "...", "detail": "...", "amount": 10000, "issued": "2026-10-02", "due": "Due on receipt" } }
+// Each one becomes a hidden catalog SKU, so a PayPal payment on the pay page records like any sponsor purchase.
+let INVOICES = {};
+try { INVOICES = JSON.parse(process.env.HBTT_INVOICES || '{}'); } catch (e) { console.error('HBTT_INVOICES is not valid JSON'); }
+Object.values(INVOICES).forEach(v => { if (v && v.sku && !CATALOG[v.sku]) CATALOG[v.sku] = { name: v.item, price: Number(v.amount) || 0, cap: 1, kind: 'sponsor', hidden: true, invoice: v.id }; });
 
 // ---------- store: the HBTT Sheet script keeps one JSON document per event (store_get / store_put, versioned) ----------
 // Fail closed: if the Sheet cannot be reached the request fails (5xx) instead of pretending the store is empty.
@@ -68,13 +76,41 @@ function emptyStore() { return { sold: {}, events: {}, orders: {}, tickets: {}, 
 function clone(x) { return JSON.parse(JSON.stringify(x)); }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const CACHE = {};   // per warm instance: ev -> { at, d }. Only public GETs use it.
+// Apps Script answers a POST with a 302 to a one-time "echo" URL holding the script's reply. Google sometimes serves that
+// echo URL before the reply is ready (404) or bounces it (302); following the bounce as a GET lands on doGet with no action,
+// which answers "unknown action". So take the first redirect by hand and re-fetch the echo URL until it returns JSON.
+// The POST itself is never re-sent here, so a write or an email can't happen twice.
+async function scriptPost(url, bodyText) {
+  const r1 = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: bodyText, redirect: 'manual' });
+  const echo = (r1.status >= 300 && r1.status < 400 && r1.headers && typeof r1.headers.get === 'function') ? r1.headers.get('location') : null;
+  if (!echo) return { status: r1.status, text: await r1.text(), ran: r1.status === 200 };
+  let last = { status: 0, text: '' };
+  for (const wait of [0, 300, 700, 1500, 3000, 5000]) {
+    if (wait) await sleep(wait);
+    let r2; try { r2 = await fetch(echo, { redirect: 'manual' }); } catch (x) { last = { status: 0, text: String(x.message || x) }; continue; }
+    const t = await r2.text();
+    if (r2.status === 200) { try { JSON.parse(t); return { status: 200, text: t, ran: true }; } catch (x) {} }
+    last = { status: r2.status, text: t };
+  }
+  return { status: last.status, text: last.text, ran: true, lost: true };
+}
 async function storeCall(body) {
   const url = process.env.SHEET_URL, key = process.env.SHEET_KEY;
   if (!url || !key) { const e = new Error('store: SHEET_URL/SHEET_KEY not set'); e.store = true; throw e; }
-  let r, t;
-  try { r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify(Object.assign({ key }, body)), redirect: 'follow' }); t = await r.text(); }
-  catch (x) { const e = new Error('store: unreachable (' + (x.message || x) + ')'); e.store = true; throw e; }
-  let j; try { j = JSON.parse(t); } catch (x) { const e = new Error('store: bad response ' + r.status); e.store = true; throw e; }
+  const text = JSON.stringify(Object.assign({ key }, body)), reads = body.action === 'store_get';
+  let r = null, err = null;
+  for (let i = 0; i < (reads ? 3 : 1); i++) {   // a read can simply be asked again; a write is never re-sent here (mutate re-reads and re-applies)
+    err = null;
+    try { r = await scriptPost(url, text); } catch (x) { err = x; r = null; }
+    if (r && r.status === 200) break;
+    if (reads && i < 2) await sleep(500 * (i + 1));
+  }
+  if (!r) { const e = new Error('store: unreachable (' + ((err && err.message) || err) + ')'); e.store = true; if (!reads) e.conflict = true; throw e; }
+  let j; try { j = JSON.parse(r.text); } catch (x) {
+    const e = new Error('store: bad response ' + r.status); e.store = true;
+    if (!reads && r.ran) e.conflict = true;   // the write may have landed: mutate re-reads and re-applies (every fn is safe to re-run)
+    throw e;
+  }
   if (!j.ok && !j.conflict) { const e = new Error('store: ' + (j.error || 'refused')); e.store = true; throw e; }
   return j;
 }
@@ -164,9 +200,9 @@ async function pushToSheet(o, tickets, ev) {
   if (E.sheet) payload.event = E.sheet;
   if (!E.urlEnv) payload.store = ev || 'hbtt';   // same script as the store: it flips sheetOk itself
   try {
-    const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify(payload), redirect: 'follow' });
-    const t = await r.text(); let j = {}; try { j = JSON.parse(t); } catch (e) { j = { raw: t.slice(0, 200) }; }
-    return { ok: r.ok && j.ok !== false, resp: j };
+    const r = await scriptPost(url, JSON.stringify(payload));
+    let j = {}; try { j = JSON.parse(r.text); } catch (e) { j = { raw: String(r.text).slice(0, 200) }; }
+    return { ok: r.status === 200 && j.ok !== false, resp: j };
   } catch (e) { return { ok: false, why: String(e.message || e) }; }
 }
 
@@ -267,10 +303,19 @@ async function webhook(req, res) {
   send(res, 200, { ok: true, env: v.env, sold: out.sold, tickets: out.t.length, sheet });
 }
 
+async function invoice(req, res) {
+  cors(res);
+  const inv = INVOICES[clean(new URL(req.url, 'http://x').searchParams.get('i'), 40)];
+  if (!inv) return send(res, 404, { ok: false, error: 'No invoice at this link. Email kyle@reservethereserve.com.' });
+  const d = await read('hbtt');
+  const paid = Object.values(d.orders).find(o => o.confirmed && (o.env || 'live') === 'live' && o.lines && o.lines[inv.sku]);
+  send(res, 200, Object.assign({ ok: true, paid: !!paid, paidAt: paid ? (paid.capturedAt || paid.at) : '' }, inv));
+}
 async function qr(req, res) {
   const q = new URL(req.url, 'http://x').searchParams;
-  const c = clean(q.get('c'), 40);
-  if (!/^(HBTT|NOBS)-[A-Z0-9]{2,4}-[A-Z0-9]{4}$/.test(c)) { res.statusCode = 400; return res.end('bad code'); }
+  const u = String(q.get('u') || '');
+  const c = u ? u : clean(q.get('c'), 40);
+  if (u ? !/^https:\/\/reservethereserve\.com\/blindtastetest\/pay\/\?i=[A-Za-z0-9]{8,24}$/.test(u) : !/^(HBTT|NOBS)-[A-Z0-9]{2,4}-[A-Z0-9]{4}$/.test(c)) { res.statusCode = 400; return res.end('bad code'); }
   const QR = require('qrcode');
   const opts = { margin: 1, errorCorrectionLevel: 'M', color: { dark: '#17120D', light: '#FFFFFF' } };
   res.statusCode = 200; res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
@@ -361,7 +406,7 @@ async function dash(req, res) {
   const orders = Object.values(d.orders).map(o => ({ id: o.id, at: o.at, capturedAt: o.capturedAt || '', env: o.env || 'live', kind: o.kind || (Object.keys(o.lines || {}).some(isTicketSku) ? 'ticket' : 'sponsor'), source: o.source || '', confirmed: !!o.confirmed, company: o.company || '', name: o.name || o.payerName || '', email: o.email || o.payerEmail || '', phone: o.phone || '', instagram: o.instagram || '', lines: o.lines || {}, total: o.total || o.amount || '', subtotal: o.subtotal || '', tax: o.tax || '', gross: o.gross || '', fee: o.fee || '', net: o.net || '', paypalOrderId: o.paypalOrderId || '', sheetOk: !!o.sheetOk, sheetAt: o.sheetAt || '', notes: o.notes || '' }));
   const tickets = Object.values(d.tickets).map(t => ({ code: t.code, sku: t.sku, day: t.day, type: t.type, name: t.name, email: t.email, env: t.env, captureId: t.captureId, issuedAt: t.issuedAt }));
   const entries = Object.values(d.entries || {}).sort((a, b) => String(b.at).localeCompare(String(a.at)));
-  send(res, 200, { ok: true, updated: d.updated || null, sold: d.sold, catalog: catalogFor(ev), pools: ev === 'hbtt' ? POOLS : {}, orders, tickets, entries });
+  send(res, 200, { ok: true, updated: d.updated || null, sold: d.sold, catalog: catalogFor(ev, true), invoices: Object.values(INVOICES), pools: ev === 'hbtt' ? POOLS : {}, orders, tickets, entries });
 }
 
 module.exports = async (req, res) => {
@@ -373,6 +418,7 @@ module.exports = async (req, res) => {
     if (path === '/api/order') return await order(req, res);
     if (path === '/api/paypal-webhook') return await webhook(req, res);
     if (path === '/api/qr') return await qr(req, res);
+    if (path === '/api/invoice') return await invoice(req, res);
     if (path === '/api/ticket') return await ticket(req, res);
     if (path === '/api/orders.csv') return await ordersCsv(req, res);
     if (path === '/api/tickets.csv') return await ticketsCsv(req, res);
